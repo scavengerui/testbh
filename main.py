@@ -8,6 +8,7 @@ import logging
 import os
 import secrets
 from datetime import datetime, timedelta
+import base64 # Added for base64 encoding of image
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -121,10 +122,18 @@ def get_captcha():
             "created_at": datetime.now()
         }
 
-        # Return image with session ID in header
-        response = StreamingResponse(BytesIO(captcha_response.content), media_type="image/jpeg")
-        response.headers["X-Session-ID"] = session_id
-        return response
+        # Return image with session ID in response body
+        # We'll encode the session ID in the image URL as a query parameter
+        image_url_with_session = f"{captcha_url}?session_id={session_id}"
+        
+        # For now, let's return a JSON response with the session ID and image data
+        image_base64 = base64.b64encode(captcha_response.content).decode('utf-8')
+        
+        return JSONResponse(content={
+            "success": True,
+            "image": f"data:image/jpeg;base64,{image_base64}",
+            "session_id": session_id
+        })
         
     except requests.exceptions.RequestException as e:
         logger.error(f"Network error: {e}")
