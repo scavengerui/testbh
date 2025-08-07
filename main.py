@@ -146,7 +146,7 @@ def fetch_timetable(
     username: str = Form(...),
     password: str = Form(...),
     captcha: str = Form(...),
-    session_id: str = Form(...),
+    session_id: str = Form(default=""),  # Made optional for backward compatibility
     academic_year_code: str = Form(default="19"),  # 2025–26
     semester_id: str = Form(default="1")  # Odd semester
 ):
@@ -154,17 +154,43 @@ def fetch_timetable(
         # Clean up expired sessions
         cleanup_expired_sessions()
         
-        # Validate session ID
-        if session_id not in captcha_sessions:
-            logger.warning(f"Invalid session ID provided: {session_id[:8]}...")
-            return JSONResponse(
-                status_code=400,
-                content={"success": False, "message": "Invalid or expired session"}
-            )
-        
-        session_data = captcha_sessions[session_id]
-        session = session_data["session"]
-        csrf = session_data["csrf"]
+        # Handle session ID validation
+        if session_id:
+            # New session-based approach
+            if session_id not in captcha_sessions:
+                logger.warning(f"Invalid session ID provided: {session_id[:8]}...")
+                return JSONResponse(
+                    status_code=400,
+                    content={"success": False, "message": "Invalid or expired session"}
+                )
+            
+            session_data = captcha_sessions[session_id]
+            session = session_data["session"]
+            csrf = session_data["csrf"]
+        else:
+            # Fallback to old approach (for backward compatibility)
+            logger.info("No session ID provided, using fallback approach")
+            session = requests.Session()
+            base_url = "https://newerp.kluniversity.in"
+            login_url = f"{base_url}/index.php?r=site%2Flogin"
+            
+            headers = {"User-Agent": "Mozilla/5.0"}
+            
+            # Get CSRF token
+            res = session.get(login_url, headers=headers, timeout=30)
+            res.raise_for_status()
+            
+            soup = BeautifulSoup(res.text, "html.parser")
+            csrf_meta = soup.find("meta", {"name": "csrf-token"})
+            
+            if not csrf_meta:
+                logger.error("CSRF token not found in response")
+                return JSONResponse(
+                    status_code=500,
+                    content={"success": False, "message": "Failed to get CSRF token"}
+                )
+            
+            csrf = csrf_meta["content"]
 
         base_url = "https://newerp.kluniversity.in"
         login_url = f"{base_url}/index.php?r=site%2Flogin"
@@ -186,8 +212,9 @@ def fetch_timetable(
         login_response.raise_for_status()
         
         if "Logout" not in login_response.text:
-            # Remove the session after failed attempt
-            del captcha_sessions[session_id]
+            # Remove the session after failed attempt (only if session_id was provided)
+            if session_id and session_id in captcha_sessions:
+                del captcha_sessions[session_id]
             logger.warning(f"Login failed for user: {username}")
             return JSONResponse(
                 status_code=400,
@@ -204,8 +231,9 @@ def fetch_timetable(
         soup_tt = BeautifulSoup(tt_response.text, "html.parser")
         table = soup_tt.find("table")
         if not table:
-            # Remove the session after failed attempt
-            del captcha_sessions[session_id]
+            # Remove the session after failed attempt (only if session_id was provided)
+            if session_id and session_id in captcha_sessions:
+                del captcha_sessions[session_id]
             logger.warning(f"Timetable not found for user: {username}")
             return JSONResponse(
                 status_code=400,
@@ -224,8 +252,9 @@ def fetch_timetable(
             slots = [td.text.strip() for td in cols[1:]]
             timetable[day] = dict(zip(headers, slots))
 
-        # Remove the session after successful login
-        del captcha_sessions[session_id]
+        # Remove the session after successful login (only if session_id was provided)
+        if session_id and session_id in captcha_sessions:
+            del captcha_sessions[session_id]
         
         logger.info(f"Successfully fetched timetable for user: {username}")
         return {
