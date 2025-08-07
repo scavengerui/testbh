@@ -6,6 +6,8 @@ import requests
 from io import BytesIO
 import logging
 import os
+import secrets
+from datetime import datetime, timedelta
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -31,13 +33,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global store for temporary session and CSRF
-captcha_cache = {}
+# Session-based CAPTCHA store
+captcha_sessions = {}
+
+# Clean up expired sessions (older than 10 minutes)
+def cleanup_expired_sessions():
+    try:
+        current_time = datetime.now()
+        expired_sessions = []
+        for session_id, data in captcha_sessions.items():
+            if current_time - data["created_at"] > timedelta(minutes=10):
+                expired_sessions.append(session_id)
+        
+        for session_id in expired_sessions:
+            del captcha_sessions[session_id]
+        
+        logger.info(f"Cleaned up {len(expired_sessions)} expired sessions")
+    except Exception as e:
+        logger.error(f"Error cleaning up sessions: {e}")
 
 # ------------------ CAPTCHA ROUTE ------------------
 @app.get("/get-captcha")
 def get_captcha():
     try:
+        # Clean up expired sessions
+        cleanup_expired_sessions()
+        
         session = requests.Session()
         base_url = "https://newerp.kluniversity.in"
         login_url = f"{base_url}/index.php?r=site%2Flogin"
@@ -90,12 +111,20 @@ def get_captcha():
         captcha_response = session.get(captcha_url, timeout=30)
         captcha_response.raise_for_status()
 
-        # Store session + csrf for reuse
-        captcha_cache["session"] = session
-        captcha_cache["csrf"] = csrf
+        # Generate unique session ID
+        session_id = secrets.token_urlsafe(16)
+        
+        # Store session data
+        captcha_sessions[session_id] = {
+            "session": session,
+            "csrf": csrf,
+            "created_at": datetime.now()
+        }
 
-        # Return CAPTCHA image as HTTP response (old way)
-        return StreamingResponse(BytesIO(captcha_response.content), media_type="image/jpeg")
+        # Return image with session ID in header
+        response = StreamingResponse(BytesIO(captcha_response.content), media_type="image/jpeg")
+        response.headers["X-Session-ID"] = session_id
+        return response
         
     except requests.exceptions.RequestException as e:
         logger.error(f"Network error: {e}")
@@ -116,19 +145,25 @@ def fetch_timetable(
     username: str = Form(...),
     password: str = Form(...),
     captcha: str = Form(...),
+    session_id: str = Form(...),
     academic_year_code: str = Form(default="19"),  # 2025–26
     semester_id: str = Form(default="1")  # Odd semester
 ):
     try:
-        session = captcha_cache.get("session")
-        csrf = captcha_cache.get("csrf")
-
-        if not session or not csrf:
-            logger.warning("No CAPTCHA session found")
+        # Clean up expired sessions
+        cleanup_expired_sessions()
+        
+        # Validate session ID
+        if session_id not in captcha_sessions:
+            logger.warning(f"Invalid session ID provided: {session_id[:8]}...")
             return JSONResponse(
                 status_code=400,
-                content={"success": False, "message": "You must call /get-captcha first"}
+                content={"success": False, "message": "Invalid or expired session"}
             )
+        
+        session_data = captcha_sessions[session_id]
+        session = session_data["session"]
+        csrf = session_data["csrf"]
 
         base_url = "https://newerp.kluniversity.in"
         login_url = f"{base_url}/index.php?r=site%2Flogin"
@@ -150,6 +185,8 @@ def fetch_timetable(
         login_response.raise_for_status()
         
         if "Logout" not in login_response.text:
+            # Remove the session after failed attempt
+            del captcha_sessions[session_id]
             logger.warning(f"Login failed for user: {username}")
             return JSONResponse(
                 status_code=400,
@@ -166,6 +203,8 @@ def fetch_timetable(
         soup_tt = BeautifulSoup(tt_response.text, "html.parser")
         table = soup_tt.find("table")
         if not table:
+            # Remove the session after failed attempt
+            del captcha_sessions[session_id]
             logger.warning(f"Timetable not found for user: {username}")
             return JSONResponse(
                 status_code=400,
@@ -184,6 +223,9 @@ def fetch_timetable(
             slots = [td.text.strip() for td in cols[1:]]
             timetable[day] = dict(zip(headers, slots))
 
+        # Remove the session after successful login
+        del captcha_sessions[session_id]
+        
         logger.info(f"Successfully fetched timetable for user: {username}")
         return {
             "success": True,
